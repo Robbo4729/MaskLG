@@ -11,8 +11,7 @@ from TLEG_vit import VisionTransformer, _cfg
 
 __all__ = [
     'deit_tiny_patch16_224', 'deit_small_patch16_224', 'deit_base_patch16_224',
-    'deit_base_patch16_384', 'deit_large_patch16_224', 
-    'deit_small_patch16_224_L24', 'deit_small_patch16_224_L36', 'deit_small_patch16_224_L48', 
+    'deit_base_patch16_384', 'deit_large_patch16_224'
 ]
 
 
@@ -143,34 +142,3 @@ def deit_base_patch16_384(pretrained=False, **kwargs):
         )
         model.load_state_dict(checkpoint["model"])
     return model
-
-
-@register_model
-def deit_small_patch16_224_L24(pretrained=False, **kwargs):
-    model = VisionTransformer(
-        patch_size=16, embed_dim=384, depth=24, num_heads=6, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(LELayerNorm, eps=1e-6), **kwargs)
-    model.default_cfg = _cfg()
-    assert not pretrained
-    return model
-
-
-@register_model
-def deit_small_patch16_224_L36(pretrained=False, **kwargs):
-    model = VisionTransformer(
-        patch_size=16, embed_dim=384, depth=36, num_heads=6, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(LELayerNorm, eps=1e-6), **kwargs)
-    model.default_cfg = _cfg()
-    assert not pretrained
-    return model
-
-
-@register_model
-def deit_small_patch16_224_L48(pretrained=False, **kwargs):
-    model = VisionTransformer(
-        patch_size=16, embed_dim=384, depth=48, num_heads=6, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(LELayerNorm, eps=1e-6), **kwargs)
-    model.default_cfg = _cfg()
-    assert not pretrained
-    return model
-
