@@ -1,21 +1,8 @@
-# Copyright (c) 2015-present, Facebook, Inc.
-# All rights reserved.
 import os
-import os.path
-import sys
-import json
-
-from PIL import Image
-
-from torch.utils.data import Dataset
-from torchvision.datasets import VisionDataset
-from torchvision import datasets, transforms
-from torchvision.datasets.folder import ImageFolder, default_loader
-
+import torchvision.datasets as datasets
+from torchvision import transforms
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.data import create_transform
-
-
 
 def build_dataset(is_train, args):
     transform = build_transform(is_train, args)
@@ -35,11 +22,9 @@ def build_dataset(is_train, args):
 
     return dataset, nb_classes
 
-
 def build_transform(is_train, args):
     resize_im = args.input_size > 32
     if is_train:
-        # this should always dispatch to transforms_imagenet_train
         transform = create_transform(
             input_size=args.input_size,
             is_training=True,
@@ -51,18 +36,13 @@ def build_transform(is_train, args):
             re_count=args.recount,
         )
         if not resize_im:
-            # replace RandomResizedCropAndInterpolation with
-            # RandomCrop
-            transform.transforms[0] = transforms.RandomCrop(
-                args.input_size, padding=4)
+            transform.transforms[0] = transforms.RandomCrop(args.input_size, padding=4)
         return transform
 
     t = []
     if resize_im:
         size = int(args.input_size / args.eval_crop_ratio)
-        t.append(
-            transforms.Resize(size, interpolation=3),  # to maintain same ratio w.r.t. 224 images
-        )
+        t.append(transforms.Resize(size, interpolation=3))
         t.append(transforms.CenterCrop(args.input_size))
 
     t.append(transforms.ToTensor())

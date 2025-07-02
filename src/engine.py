@@ -1,18 +1,22 @@
-"""
-Train and eval functions used in main.py
-"""
 import math
 import sys
 from typing import Iterable, Optional
 
 import torch
+from torch.nn.utils import clip_grad_norm_, clip_grad_value_
 
 from timm.data import Mixup
 from timm.utils import accuracy, ModelEma
 
-from losses import DistillationLoss
 import utils
 
+def dispatch_clip_grad(parameters, clip_value, mode='norm'):
+    if mode == 'norm':
+        return clip_grad_norm_(parameters, clip_value)
+    elif mode == 'value':
+        return clip_grad_value_(parameters, clip_value)
+    else:
+        raise ValueError(f"Unknown clip mode: {mode}")
 
 class NativeScalerGA:
     state_dict_key = "amp_scaler"
@@ -24,7 +28,7 @@ class NativeScalerGA:
         self._scaler.scale(loss).backward(create_graph=create_graph)
         if clip_grad is not None:
             assert parameters is not None
-            self._scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
+            self._scaler.unscale_(optimizer)
             dispatch_clip_grad(parameters, clip_grad, mode=clip_mode)
         if do_step:
             self._scaler.step(optimizer)
@@ -36,33 +40,31 @@ class NativeScalerGA:
     def load_state_dict(self, state_dict):
         self._scaler.load_state_dict(state_dict)
 
-
-def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
+def train_one_epoch(model: torch.nn.Module, criterion,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
-                    set_training_mode=True, accumulation_step=1):
+                    set_training_mode=True, accumulation_step=1, mask_training=False, mask_only=False):
     model.train(set_training_mode)
-    
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 50
     count = 0
 
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
-        count+=1
-        do_step = (count%accumulation_step==0)
+        count += 1
+        do_step = (count % accumulation_step == 0)
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
+        is_second_order = False
 
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
         with torch.cuda.amp.autocast():
             outputs = model(samples)
-            loss = criterion(samples, outputs, targets)
+            loss = criterion(outputs, targets)
 
         loss_value = loss.item()
 
@@ -71,13 +73,15 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
             sys.exit(1)
 
         if do_step:
-            optimizer.zero_grad()
-
-        # this attribute is added by timm on one optimizer (adahessian)
-        is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-        loss_scaler(loss, optimizer, clip_grad=max_norm,
-                    parameters=model.parameters(), create_graph=is_second_order, do_step=do_step)
-
+            if mask_only:
+                mask_params = [p for n, p in model.named_parameters() if 'mask_logits' in n]
+                optimizer.zero_grad()
+                loss_scaler(loss, optimizer, clip_grad=max_norm,
+                            parameters=mask_params, create_graph=is_second_order, do_step=do_step)
+            else:
+                optimizer.zero_grad()
+                loss_scaler(loss, optimizer, clip_grad=max_norm,
+                            parameters=model.parameters(), create_graph=is_second_order, do_step=do_step)
         torch.cuda.synchronize()
         if model_ema is not None and do_step:
             model_ema.update(model)
@@ -85,7 +89,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         metric_logger.update(loss=loss_value)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         
-    # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     
@@ -99,7 +102,6 @@ def evaluate(data_loader, model, device):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
 
-    # switch to evaluation mode
     model.eval()
 
     for images, target in metric_logger.log_every(data_loader, 10, header):

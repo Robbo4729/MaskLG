@@ -1,16 +1,17 @@
+# filepath: /Users/xianglinluo/MaskLearngene/MaskLG/src/utils.py
 """
 Misc functions, including distributed helpers.
 
 Mostly copy-paste from torchvision references.
 """
-import io
-import os
-import time
 from collections import defaultdict, deque
-import datetime
-
 import torch
 import torch.distributed as dist
+import time
+import datetime
+import io
+import os
+import builtins
 
 
 class SmoothedValue(object):
@@ -32,9 +33,6 @@ class SmoothedValue(object):
         self.total += value * n
 
     def synchronize_between_processes(self):
-        """
-        Warning: does not synchronize the deque!
-        """
         if not is_dist_avail_and_initialized():
             return
         t = torch.tensor([self.count, self.total], dtype=torch.float64, device='cuda')
@@ -84,12 +82,11 @@ class MetricLogger(object):
         for k, v in kwargs.items():
             if isinstance(v, torch.Tensor):
                 v = v.item()
-            assert isinstance(v, (float, int))
             self.meters[k].update(v)
 
     def __getattr__(self, attr):
         if attr in self.meters:
-            return self.meters[attr]
+            return self.meters[attr].avg
         if attr in self.__dict__:
             return self.__dict__[attr]
         raise AttributeError("'{}' object has no attribute '{}'".format(
@@ -98,9 +95,7 @@ class MetricLogger(object):
     def __str__(self):
         loss_str = []
         for name, meter in self.meters.items():
-            loss_str.append(
-                "{}: {}".format(name, str(meter))
-            )
+            loss_str.append(f"{name}: {meter}")
         return self.delimiter.join(loss_str)
 
     def synchronize_between_processes(self):
@@ -128,29 +123,24 @@ class MetricLogger(object):
             'data: {data}'
         ]
         if torch.cuda.is_available():
-            log_msg.append('max mem: {memory:.0f}')
+            log_msg.append('max mem: {mem}')
         log_msg = self.delimiter.join(log_msg)
         MB = 1024.0 * 1024.0
         for obj in iterable:
             data_time.update(time.time() - end)
             yield obj
             iter_time.update(time.time() - end)
-            if i % print_freq == 0 or i == len(iterable) - 1:
-                eta_seconds = iter_time.global_avg * (len(iterable) - i)
-                eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
-                if torch.cuda.is_available():
-                    print(log_msg.format(
-                        i, len(iterable), eta=eta_string,
-                        meters=str(self),
-                        time=str(iter_time), data=str(data_time),
-                        memory=torch.cuda.max_memory_allocated() / MB))
-                else:
-                    print(log_msg.format(
-                        i, len(iterable), eta=eta_string,
-                        meters=str(self),
-                        time=str(iter_time), data=str(data_time)))
-            i += 1
             end = time.time()
+            if i % print_freq == 0 or i + 1 == len(iterable):
+                print(log_msg.format(
+                    i, len(iterable),
+                    eta=str(datetime.timedelta(seconds=int((len(iterable) - i) * iter_time.avg))),
+                    meters=self,
+                    time=iter_time,
+                    data=data_time,
+                    mem=torch.cuda.max_memory_allocated() / MB if torch.cuda.is_available() else 0,
+                ))
+            i += 1
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print('{} Total time: {} ({:.4f} s / it)'.format(
@@ -158,9 +148,6 @@ class MetricLogger(object):
 
 
 def _load_checkpoint_for_ema(model_ema, checkpoint):
-    """
-    Workaround for ModelEma._load_checkpoint to accept an already-loaded object
-    """
     mem_file = io.BytesIO()
     torch.save(checkpoint, mem_file)
     mem_file.seek(0)
@@ -168,18 +155,14 @@ def _load_checkpoint_for_ema(model_ema, checkpoint):
 
 
 def setup_for_distributed(is_master):
-    """
-    This function disables printing when not in master process
-    """
-    import builtins as __builtin__
-    builtin_print = __builtin__.print
+    builtin_print = builtins.print
 
     def print(*args, **kwargs):
         force = kwargs.pop('force', False)
         if is_master or force:
             builtin_print(*args, **kwargs)
 
-    __builtin__.print = print
+    builtins.print = print
 
 
 def is_dist_avail_and_initialized():
@@ -237,7 +220,6 @@ def init_distributed_mode(args):
 
 
 def gene_tranfer(args, cp, num_layers, load_head=False):
-    
     cp_new = dict()
     
     all_shared = ['pos_embed', 'patch_embed.proj.weight', 'patch_embed.proj.bias']
@@ -253,33 +235,33 @@ def gene_tranfer(args, cp, num_layers, load_head=False):
         k = 'blocks.'+str(i)+'.'
 
         cp_new[k+'attn.qkv.weight'] = \
-        i/num_layers * cp['blocks.block.attn.qkv.instances.0.weight_ilayer'] + cp['blocks.block.attn.qkv.instances.0.weight_base']
+            i/num_layers * cp['blocks.block.attn.qkv.instances.0.weight_ilayer'] + cp['blocks.block.attn.qkv.instances.0.weight_base']
         cp_new[k+'attn.qkv.bias'] = \
-        i/num_layers * cp['blocks.block.attn.qkv.instances.0.bias_ilayer'] + cp['blocks.block.attn.qkv.instances.0.bias_base']
+            i/num_layers * cp['blocks.block.attn.qkv.instances.0.bias_ilayer'] + cp['blocks.block.attn.qkv.instances.0.bias_base']
 
         cp_new[k+'attn.proj.weight'] = \
-        i/num_layers * cp['blocks.block.attn.proj.instances.0.weight_ilayer'] + cp['blocks.block.attn.proj.instances.0.weight_base']
+            i/num_layers * cp['blocks.block.attn.proj.instances.0.weight_ilayer'] + cp['blocks.block.attn.qkv.instances.0.weight_base']
         cp_new[k+'attn.proj.bias'] = \
-        i/num_layers * cp['blocks.block.attn.proj.instances.0.bias_ilayer'] + cp['blocks.block.attn.proj.instances.0.bias_base']
+            i/num_layers * cp['blocks.block.attn.proj.instances.0.bias_ilayer'] + cp['blocks.block.attn.qkv.instances.0.bias_base']
         
         cp_new[k+'mlp.fc1.weight'] = \
-        i/num_layers * cp['blocks.block.mlp.fc1.instances.0.weight_ilayer'] + cp['blocks.block.mlp.fc1.instances.0.weight_base']
+            i/num_layers * cp['blocks.block.mlp.fc1.instances.0.weight_ilayer'] + cp['blocks.block.mlp.fc1.instances.0.weight_base']
         cp_new[k+'mlp.fc1.bias'] = \
-        i/num_layers * cp['blocks.block.mlp.fc1.instances.0.bias_ilayer'] + cp['blocks.block.mlp.fc1.instances.0.bias_base']
+            i/num_layers * cp['blocks.block.mlp.fc1.instances.0.bias_ilayer'] + cp['blocks.block.mlp.fc1.instances.0.bias_base']
 
         cp_new[k+'mlp.fc2.weight'] = \
-        i/num_layers * cp['blocks.block.mlp.fc2.instances.0.weight_ilayer'] + cp['blocks.block.mlp.fc2.instances.0.weight_base']
+            i/num_layers * cp['blocks.block.mlp.fc2.instances.0.weight_ilayer'] + cp['blocks.block.mlp.fc2.instances.0.weight_base']
         cp_new[k+'mlp.fc2.bias'] = \
-        i/num_layers * cp['blocks.block.mlp.fc2.instances.0.bias_ilayer'] + cp['blocks.block.mlp.fc2.instances.0.bias_base']
+            i/num_layers * cp['blocks.block.mlp.fc2.instances.0.bias_ilayer'] + cp['blocks.block.mlp.fc2.instances.0.bias_base']
         
         cp_new[k+'norm1.bias'] = \
-        i/num_layers * cp['blocks.block.norm1.instances.0.bias_ilayer'] + cp['blocks.block.norm1.instances.0.bias_base']
+            i/num_layers * cp['blocks.block.norm1.instances.0.bias_ilayer'] + cp['blocks.block.norm1.instances.0.bias_base']
         cp_new[k+'norm1.weight'] = \
-        i/num_layers * cp['blocks.block.norm1.instances.0.weight_ilayer'] + cp['blocks.block.norm1.instances.0.weight_base']
+            i/num_layers * cp['blocks.block.norm1.instances.0.weight_ilayer'] + cp['blocks.block.norm1.instances.0.weight_base']
 
         cp_new[k+'norm2.bias'] = \
-        i/num_layers * cp['blocks.block.norm2.instances.0.bias_ilayer'] + cp['blocks.block.norm2.instances.0.bias_base']
+            i/num_layers * cp['blocks.block.norm2.instances.0.bias_ilayer'] + cp['blocks.block.norm2.instances.0.bias_base']
         cp_new[k+'norm2.weight'] = \
-        i/num_layers * cp['blocks.block.norm2.instances.0.weight_ilayer'] + cp['blocks.block.norm2.instances.0.weight_base']
+            i/num_layers * cp['blocks.block.norm2.instances.0.weight_ilayer'] + cp['blocks.block.norm2.instances.0.weight_base']
         
     return cp_new

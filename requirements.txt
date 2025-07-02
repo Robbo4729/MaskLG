@@ -1,0 +1,70 @@
+torch==1.13.0
+torchvision==0.14.0
+timm==0.6.12
+Pillow==9.2.0
+numpy==1.23.1
+matplotlib==3.5.2
+scikit-learn==1.1.2
+<|endoffile|>import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MaskedBlock(nn.Module):
+    def __init__(self, block, temperature=1.0, threshold=0.5):
+        super().__init__()
+        self.block = block
+        self.temperature = temperature
+        self.threshold = threshold
+        
+        # Create mask logits for each parameter in the block
+        self.mask_logits = nn.ParameterDict()
+        for name, param in self.block.named_parameters():
+            if param.requires_grad:
+                self.mask_logits[name] = nn.Parameter(
+                    torch.randn_like(param) * 0.01, 
+                    requires_grad=True
+                )
+    
+    def forward(self, x):
+        # Generate binary mask using Gumbel-Softmax
+        masks = {}
+        for name, param in self.block.named_parameters():
+            if name in self.mask_logits:
+                logits = self.mask_logits[name]
+                mask = F.gumbel_softmax(logits.view(-1, 2), tau=self.temperature, hard=False)[:, 0]
+                mask = mask.view(logits.shape)
+                masks[name] = mask
+            else:
+                masks[name] = torch.ones_like(param)
+        
+        # Save original parameters and apply mask
+        original_params = {}
+        for name, param in self.block.named_parameters():
+            original_params[name] = param.data.clone()
+            if name in masks:
+                param.data = param.data * masks[name]
+        
+        # Forward pass
+        out = self.block(x)
+        
+        # Restore original parameters
+        for name, param in self.block.named_parameters():
+            if name in original_params:
+                param.data = original_params[name]
+        
+        return out
+    
+    def get_masked_parameters(self):
+        # Get parameters after applying the mask
+        masked_params = {}
+        for name, param in self.block.named_parameters():
+            if name in self.mask_logits:
+                # Generate binary mask using threshold
+                mask = (torch.sigmoid(self.mask_logits[name]) > self.threshold).float()
+                masked_params[name] = param.data * mask
+            else:
+                masked_params[name] = param.data.clone()
+        return masked_params
+    
+    def update_temperature(self, new_temp):
+        self.temperature = new_temp
