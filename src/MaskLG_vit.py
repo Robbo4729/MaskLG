@@ -20,7 +20,9 @@ class Block(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, N, C)
+        # 确保输入形状正确
+        if len(x.shape) != 3 or x.shape[-1] != self.norm1.normalized_shape[0]:
+            raise ValueError(f"Expected input shape [*, {self.norm1.normalized_shape[0]}], got {x.shape}")
         x_ = self.norm1(x)
         x_ = x_.transpose(0, 1)  # (N, B, C) for MultiheadAttention
         attn_out, _ = self.attn(x_, x_, x_)
@@ -48,6 +50,15 @@ class MaskedBlock(nn.Module):
                 )
 
     def forward(self, x):
+        # 确保输入形状正确
+        if len(x.shape) != 3 or x.shape[-1] != self.block.norm1.normalized_shape[0]:
+            # 进行patch embedding和形状调整
+            # 假设VisionTransformer类中有patch_embed方法
+            if hasattr(self.block, 'patch_embed'):
+                x = self.block.patch_embed(x).flatten(2).transpose(1, 2)
+            else:
+                raise ValueError(f"Expected input shape [*, {self.block.norm1.normalized_shape[0]}], got {x.shape}")
+
         original_params = {}
         for name, param in self.block.named_parameters():
             safe_name = name.replace('.', '_')
@@ -98,7 +109,7 @@ class VisionTransformer(nn.Module):
         self.temperature = temperature
         self.threshold = threshold
 
-       # ----------- 新增 patch embedding 相关代码 -----------
+        # ----------- 新增 patch embedding 相关代码 -----------
         self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
         num_patches = (img_size // patch_size) ** 2
 
@@ -142,26 +153,26 @@ class VisionTransformer(nn.Module):
             nn.init.constant_(m.bias, 0)
 
     def forward_features(self, x):
-        # x = self.patch_embed(x)
-        # if self.use_cls_token:
-        #     cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
-        #     x = torch.cat((cls_tokens, x), dim=1)
-        # x = x + self.pos_embed
-        # x = self.pos_drop(x)
+        x = self.patch_embed(x).flatten(2).transpose(1, 2)
+        if self.use_cls_token:
+            cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
+            x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+
         for blk in self.blocks:
             x = blk(x)
-        # x = self.norm(x)
-        # if self.use_cls_token:
-        #     return x[:, 0]
-        # else:
-        #     return x.mean(dim=1)
-        return x
+
+        x = self.norm(x)
+        if self.use_cls_token:
+            return x[:, 0]
+        else:
+            return x.mean(dim=1)
     
     def forward(self, x):
         # x: [B, 3, H, W]
-        x = self.patch_embed(x)  # [B, num_patches, embed_dim]
-        # ...后续流程...
-        return self.head(self.forward_features(x))
+        x = self.forward_features(x)
+        return self.head(x)
 
     def get_masked_parameters(self):
         masked_params = {}
