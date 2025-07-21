@@ -9,25 +9,28 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
-from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.models import create_model
 from timm.optim import create_optimizer
 from timm.scheduler import create_scheduler
 from timm.utils import ModelEma, get_state_dict
 from torch.utils.data import DataLoader, DistributedSampler, SequentialSampler
 
-import models
 import utils
 from datasets import build_dataset
 from engine import evaluate, mask_train_one_epoch
 from losses import DistillationLoss
-from masked_functions import update_temperature, get_binary_mask, analyze_nonzero_parameters
+from masked_functions import (
+    update_temperature,
+    get_binary_mask,
+    analyze_nonzero_parameters,
+)
 from samplers import RASampler
+from torch.utils.tensorboard import SummaryWriter
 
 
 def get_args_parser():
     parser = argparse.ArgumentParser("MaskLG training", add_help=False)
-    #决定进行哪个阶段（Stage 1: Extracting learngene or Stage 2: Building descendent models）
+    # 决定进行哪个阶段（Stage 1: Extracting learngene or Stage 2: Building descendent models）
     parser.add_argument(
         "--stage",
         default="stage1",
@@ -73,9 +76,6 @@ def get_args_parser():
     )
     parser.add_argument(
         "--epochs", default=10, type=int, help="Number of training epochs."
-    )
-    parser.add_argument(
-        "--lr", default=0.01, type=float, help="Learning rate for the optimizer."
     )
     parser.add_argument(
         "--temperature",
@@ -148,9 +148,6 @@ def get_args_parser():
         metavar="NAME",
         help='Use AutoAugment policy. "v0" or "original". " + \
                              "(default: rand-m9-mstd0.5-inc1)',
-    )
-    parser.add_argument(
-        "--smoothing", type=float, default=0.1, help="Label smoothing (default: 0.1)"
     )
     parser.add_argument(
         "--train-interpolation",
@@ -264,52 +261,35 @@ def get_args_parser():
         metavar="M",
         help="SGD momentum (default: 0.9)",
     )
-    parser.add_argument(
-        "--sched",
-        default="cosine",
-        type=str,
-        metavar="SCHEDULER",
-        help='LR scheduler (default: "cosine"',
-    )
-    # * Mixup params
-    parser.add_argument(
-        "--mixup",
-        type=float,
-        default=0.8,
-        help="mixup alpha, mixup enabled if > 0. (default: 0.8)",
-    )
-    parser.add_argument(
-        "--cutmix",
-        type=float,
-        default=1.0,
-        help="cutmix alpha, cutmix enabled if > 0. (default: 1.0)",
-    )
-    parser.add_argument(
-        "--cutmix-minmax",
-        type=float,
-        nargs="+",
-        default=None,
-        help="cutmix min/max ratio, overrides alpha and enables cutmix if set (default: None)",
-    )
-    parser.add_argument(
-        "--mixup-prob",
-        type=float,
-        default=1.0,
-        help="Probability of performing mixup or cutmix when either/both is enabled",
-    )
-    parser.add_argument(
-        "--mixup-switch-prob",
-        type=float,
-        default=0.5,
-        help="Probability of switching to cutmix when both mixup and cutmix enabled",
-    )
-    parser.add_argument(
-        "--mixup-mode",
-        type=str,
-        default="batch",
-        help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"',
-    )
-    #温度衰减参数
+
+    # Learning rate schedule parameters
+    parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
+                        help='LR scheduler (default: "cosine"')
+    parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
+                        help='learning rate (default: 5e-4)')
+    parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
+                        help='learning rate noise on/off epoch percentages')
+    parser.add_argument('--lr-noise-pct', type=float, default=0.67, metavar='PERCENT',
+                        help='learning rate noise limit percent (default: 0.67)')
+    parser.add_argument('--lr-noise-std', type=float, default=1.0, metavar='STDDEV',
+                        help='learning rate noise std-dev (default: 1.0)')
+    parser.add_argument('--warmup-lr', type=float, default=1e-5, metavar='LR',
+                        help='warmup learning rate (default: 1e-5)')
+    parser.add_argument('--min-lr', type=float, default=1e-5, metavar='LR',
+                        help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
+
+    parser.add_argument('--decay-epochs', type=float, default=30, metavar='N',
+                        help='epoch interval to decay LR')
+    parser.add_argument('--warmup-epochs', type=int, default=0, metavar='N',
+                        help='epochs to warmup LR, if scheduler supports')
+    parser.add_argument('--cooldown-epochs', type=int, default=10, metavar='N',
+                        help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
+    parser.add_argument('--patience-epochs', type=int, default=10, metavar='N',
+                        help='patience epochs for Plateau LR scheduler (default: 10')
+    parser.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RATE',
+                        help='LR decay rate (default: 0.1)')
+    
+    # 温度衰减参数
     parser.add_argument(
         "--min-temperature",
         default=0.1,
@@ -323,7 +303,7 @@ def get_args_parser():
         choices=["linear", "exp", "cosine"],
         help="Temperature decay schedule type.",
     )
-    #稀疏正则化参数
+    # 稀疏正则化参数
     parser.add_argument(
         "--sparse-reg",
         type=float,
@@ -403,18 +383,7 @@ def main(args):
         drop_last=False,
     )
 
-    #定义损失函数
-    criterion = LabelSmoothingCrossEntropy()
-
-    if args.mixup > 0.0:
-        # smoothing is handled with mixup label transform
-        criterion = SoftTargetCrossEntropy()
-    elif args.smoothing:
-        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-    else:
-        criterion = torch.nn.CrossEntropyLoss()
-
-    #创建 ancestor model
+    # 创建 ancestor model
     ancestor_model = None
     if args.distillation_type != "none":
         print(f"Creating ancestor model: {args.ancestor_model}")
@@ -424,7 +393,7 @@ def main(args):
             args.ancestor_model,
             pretrained=ancestor_pretrained,
             num_classes=args.nb_classes,
-            #global_pool="avg",
+            # global_pool="avg",
         )
         if not ancestor_pretrained:
             if args.ancestor_path.startswith("https"):
@@ -446,21 +415,21 @@ def main(args):
     )
     print("number of params in ancestor_model:", n_parameters)
 
-    #For stage 1: Construct auxiliary model
+    # For stage 1: Construct auxiliary model
     if args.stage == "stage1":
         if ancestor_model is not None:
-            #model为辅助模型
+            # model为辅助模型
             model = create_model(
                 args.ancestor_model,
                 pretrained=False,  # 不加载预训练参数
                 num_classes=args.nb_classes,
-                drop_rate=0.0,    # 保持与ancestor_model相同的配置
+                drop_rate=0.0,  # 保持与ancestor_model相同的配置
                 drop_path_rate=0.0,
             )
             model.load_state_dict(ancestor_model.state_dict(), strict=True)
             model.to(device)
 
-    #For Stage 2: Construct descendant models
+    # For Stage 2: Construct descendant models
     if args.stage == "stage2":
         model = create_model(
             args.model,
@@ -506,7 +475,10 @@ def main(args):
                 -1, orig_size, orig_size, embedding_size
             ).permute(0, 3, 1, 2)
             pos_tokens = torch.nn.functional.interpolate(
-                pos_tokens, size=(new_size, new_size), mode="bicubic", align_corners=False
+                pos_tokens,
+                size=(new_size, new_size),
+                mode="bicubic",
+                align_corners=False,
             )
             pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
             new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
@@ -531,13 +503,7 @@ def main(args):
         model_without_ddp = model.module
 
     if not args.unscale_lr:
-        linear_scaled_lr = (
-            args.lr
-            * args.batch_size
-            * utils.get_world_size()
-            * args.accumulation_step
-            / 512.0
-        )
+        linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() * args.accumulation_step / 512.0
         args.lr = linear_scaled_lr
 
     if args.stage == "stage2":
@@ -548,7 +514,7 @@ def main(args):
     # wrap the criterion in our custom DistillationLoss, which
     # just dispatches to the original criterion if args.distillation_type is 'none'
     criterion = DistillationLoss(
-        criterion,
+        torch.nn.CrossEntropyLoss(), #base_criterion
         ancestor_model,
         args.distillation_type,
         args.distillation_alpha,
@@ -567,33 +533,47 @@ def main(args):
     start_time = time.time()
     max_accuracy = 0.0
 
-    epochs=args.epochs
-    lr=args.lr
-    threshold=args.threshold
+    epochs = args.epochs
+    lr = args.lr
+    threshold = args.threshold
     initial_temp = args.temperature
     min_temp = args.min_temperature
 
-    #进入mask训练阶段
+    # 创建SummaryWriter
+    writer = SummaryWriter(log_dir=os.path.join(args.output_dir, 'tensorboard_logs'))
+
+
+    # 进入mask训练阶段
     if args.stage == "stage1":
 
         # 为每个可训练参数新建mask_logits
         model_without_ddp.mask_logits = {}
         for name, param in model_without_ddp.named_parameters():
-            if param.requires_grad: #and param.dim() > 1 
-                model_without_ddp.mask_logits[name] = torch.nn.Parameter(torch.randn_like(param, device=device), requires_grad=True)
-    
+            if param.requires_grad:  # and param.dim() > 1
+                model_without_ddp.mask_logits[name] = torch.nn.Parameter(
+                    torch.zeros_like(param, device=device), requires_grad=True
+                )
+
         # 创建单个优化器优化所有mask_logits
-        mask_optimizer = torch.optim.Adam(model_without_ddp.mask_logits.values(), lr=args.lr)
+        mask_optimizer = torch.optim.Adam(
+            model_without_ddp.mask_logits.values(), lr=args.lr
+        )
+
         # 为mask_optimizer创建学习率调度器
         lr_scheduler, _ = create_scheduler(args, mask_optimizer)
-            
+
+        #评估祖先模型的性能
+        test_stats = evaluate(data_loader_val, ancestor_model, device)
+        
         for epoch in range(epochs):
             # 更新温度
-            current_temp = update_temperature(initial_temp, min_temp, epoch, epochs, args.temperature_decay)
+            current_temp = update_temperature(
+                initial_temp, min_temp, epoch, epochs, args.temperature_decay
+            )
 
             print(f"Epoch {epoch+1}/{epochs} with temperature: {current_temp:.4f}")
-                
-            test_stats = mask_train_one_epoch(
+
+            train_result = mask_train_one_epoch(
                 model_without_ddp,
                 ancestor_model,
                 criterion,
@@ -603,21 +583,24 @@ def main(args):
                 epoch,
                 max_norm=0,
                 model_ema=None,
-                mixup_fn=None,
                 set_training_mode=args.train_mode,
-                accumulation_step=1,
+                accumulation_step=args.accumulation_step,
                 mask_training=True,
                 mask_only=True,
                 temperature=current_temp,
-                sparse_reg=args.sparse_reg # 稀疏正则化参数
+                sparse_reg=args.sparse_reg,  # 稀疏正则化参数
+                writer = writer,  # 添加TensorBoard记录器
             )
 
-            lr_scheduler.step(epoch)
-                
-            # 评估当前block训练后的效果
-            test_stats = evaluate(data_loader_val, model, device)
-            print(f"Epoch {epoch+1}/{epochs} - Accuracy: {test_stats['acc1']:.1f}%")
+            lr_scheduler.step(epoch)  
+            
+            # 在评估前加载最新的参数
+            if train_result['final_sparse_state'] is not None:
+                model_without_ddp.load_state_dict(train_result['final_sparse_state'], strict=True)
 
+            # 评估训练后的效果
+            test_stats = evaluate(data_loader_val, model, device)    
+            print(f"Epoch {epoch+1}/{epochs} - Accuracy: {test_stats['acc1']:.1f}%")
 
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -627,32 +610,36 @@ def main(args):
         if args.output_dir and test_stats["acc1"] > max_accuracy:
             max_accuracy = test_stats["acc1"]
             checkpoint = {
-                'model': model.state_dict(),
-                'args': args,
-                'mask_logits': model_without_ddp.mask_logits.state_dict(),
-                'optimizer': mask_optimizer.state_dict(),
-                'epoch': epoch,
+                "model": model.state_dict(),
+                "args": args,
+                "mask_logits": model_without_ddp.mask_logits.state_dict(),
+                "optimizer": mask_optimizer.state_dict(),
+                "epoch": epoch,
             }
-        
-            torch.save(
-                checkpoint,
-                os.path.join(args.output_dir, 'checkpoint_best.pth')
-            )
+
+            torch.save(checkpoint, os.path.join(args.output_dir, "checkpoint_best.pth"))
 
         # After training, generate binary mask for stage1
-        hard_mask = get_binary_mask(model_without_ddp.mask_logits, args.threshold, temperature = 0.1)
+        hard_mask = get_binary_mask(
+            model_without_ddp.mask_logits, args.threshold, temperature=0.1
+        )
 
-        #Apply mask to get final parameters
+        # Apply mask to get final parameters
         Learngene = model.state_dict()
         for name, mask in hard_mask.items():
             Learngene[name] = Learngene[name] * mask
-        
+
         # Save final masked model
         if args.output_dir:
-            torch.save({
-                'model': Learngene,
-                'mask': hard_mask,
-            }, os.path.join(args.output_dir, 'masked_model.pth'))
+            torch.save(
+                {
+                    "model": Learngene,
+                    "mask": hard_mask,
+                },
+                os.path.join(args.output_dir, "masked_model.pth"),
+            )
+
+        writer.close()  # 关闭TensorBoard记录器
 
     print(
         f"Auxiliary model parameter count after training: {sum(p.numel() for p in model.parameters())}"
