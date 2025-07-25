@@ -1,9 +1,7 @@
-# filepath: /Users/xianglinluo/MaskLearngene/MaskLG/src/utils.py
 """
-Misc functions, including distributed helpers.
+Misc functions adapted for Lightning Fabric.
+"""
 
-Mostly copy-paste from torchvision references.
-"""
 import builtins
 import datetime
 import io
@@ -12,7 +10,7 @@ import time
 from collections import defaultdict, deque
 
 import torch
-import torch.distributed as dist
+from lightning.fabric import Fabric
 
 
 class SmoothedValue(object):
@@ -33,15 +31,14 @@ class SmoothedValue(object):
         self.count += n
         self.total += value * n
 
-    def synchronize_between_processes(self):
-        if not is_dist_avail_and_initialized():
+    def synchronize_between_processes(self, fabric: Fabric):
+        """Synchronize count and total across processes using Fabric"""
+        if fabric.world_size == 1:
             return
-        t = torch.tensor([self.count, self.total], dtype=torch.float64, device="cuda")
-        dist.barrier()
-        dist.all_reduce(t)
-        t = t.tolist()
-        self.count = int(t[0])
-        self.total = t[1]
+        t = torch.tensor([self.count, self.total], dtype=torch.float64, device="cpu")
+        t = fabric.all_reduce(t, reduce_op="sum")
+        self.count = int(t[0].item())
+        self.total = t[1].item()
 
     @property
     def median(self):
@@ -76,14 +73,16 @@ class SmoothedValue(object):
 
 
 class MetricLogger(object):
-    def __init__(self, delimiter="\t"):
+    def __init__(self, fabric: Fabric, delimiter="\t"):
         self.meters = defaultdict(SmoothedValue)
         self.delimiter = delimiter
+        self.fabric = fabric  # Store Fabric instance for distributed operations
 
     def update(self, **kwargs):
         for k, v in kwargs.items():
             if isinstance(v, torch.Tensor):
                 v = v.item()
+            assert isinstance(v, (float, int))
             self.meters[k].update(v)
 
     def __getattr__(self, attr):
@@ -102,8 +101,9 @@ class MetricLogger(object):
         return self.delimiter.join(loss_str)
 
     def synchronize_between_processes(self):
+        """Synchronize all meters across processes"""
         for meter in self.meters.values():
-            meter.synchronize_between_processes()
+            meter.synchronize_between_processes(self.fabric)
 
     def add_meter(self, name, meter):
         self.meters[name] = meter
@@ -125,7 +125,7 @@ class MetricLogger(object):
             "time: {time}",
             "data: {data}",
         ]
-        if torch.cuda.is_available():
+        if self.fabric.device.type == "cuda":
             log_msg.append("max mem: {mem}")
         log_msg = self.delimiter.join(log_msg)
         MB = 1024.0 * 1024.0
@@ -135,7 +135,7 @@ class MetricLogger(object):
             iter_time.update(time.time() - end)
             end = time.time()
             if i % print_freq == 0 or i + 1 == len(iterable):
-                print(
+                self.fabric.print(
                     log_msg.format(
                         i,
                         len(iterable),
@@ -149,7 +149,7 @@ class MetricLogger(object):
                         data=data_time,
                         mem=(
                             torch.cuda.max_memory_allocated() / MB
-                            if torch.cuda.is_available()
+                            if self.fabric.device.type == "cuda"
                             else 0
                         ),
                     )
@@ -157,7 +157,7 @@ class MetricLogger(object):
             i += 1
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print(
+        self.fabric.print(
             "{} Total time: {} ({:.4f} s / it)".format(
                 header, total_time_str, total_time / len(iterable)
             )
@@ -169,77 +169,6 @@ def _load_checkpoint_for_ema(model_ema, checkpoint):
     torch.save(checkpoint, mem_file)
     mem_file.seek(0)
     model_ema._load_checkpoint(mem_file)
-
-
-def setup_for_distributed(is_master):
-    builtin_print = builtins.print
-
-    def print(*args, **kwargs):
-        force = kwargs.pop("force", False)
-        if is_master or force:
-            builtin_print(*args, **kwargs)
-
-    builtins.print = print
-
-
-def is_dist_avail_and_initialized():
-    if not dist.is_available():
-        return False
-    if not dist.is_initialized():
-        return False
-    return True
-
-
-def get_world_size():
-    if not is_dist_avail_and_initialized():
-        return 1
-    return dist.get_world_size()
-
-
-def get_rank():
-    if not is_dist_avail_and_initialized():
-        return 0
-    return dist.get_rank()
-
-
-def is_main_process():
-    return get_rank() == 0
-
-
-def save_on_master(*args, **kwargs):
-    if is_main_process():
-        torch.save(*args, **kwargs)
-
-
-def init_distributed_mode(args):
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        args.rank = int(os.environ["RANK"])
-        args.world_size = int(os.environ["WORLD_SIZE"])
-        args.gpu = int(os.environ["LOCAL_RANK"])
-    elif "SLURM_PROCID" in os.environ:
-        args.rank = int(os.environ["SLURM_PROCID"])
-        args.gpu = args.rank % torch.cuda.device_count()
-    else:
-        print("Not using distributed mode")
-        args.distributed = False
-        return
-
-    args.distributed = True
-
-    torch.cuda.set_device(args.gpu)
-    args.dist_backend = "nccl"
-    print(
-        "| distributed init (rank {}): {}".format(args.rank, args.dist_url), flush=True
-    )
-    torch.distributed.init_process_group(
-        backend=args.dist_backend,
-        init_method=args.dist_url,
-        world_size=args.world_size,
-        rank=args.rank,
-        # device_id=args.gpu,
-    )
-    torch.distributed.barrier()
-    setup_for_distributed(args.rank == 0)
 
 
 def gene_tranfer(args, cp, num_layers, load_head=False):

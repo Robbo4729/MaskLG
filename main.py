@@ -1,31 +1,33 @@
 import argparse
 import datetime
-import math
 import os
 import time
 from pathlib import Path
 
+import lightning as L
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
+from lightning.fabric import Fabric
 from timm.models import create_model
 from timm.optim import create_optimizer
 from timm.scheduler import create_scheduler
 from timm.utils import ModelEma, get_state_dict
+from torch.distributed import init_process_group
 from torch.utils.data import DataLoader, DistributedSampler, SequentialSampler
-
+from torch.utils.tensorboard import SummaryWriter
+from lightning.fabric.loggers.tensorboard import TensorBoardLogger
 import utils
 from datasets import build_dataset
 from engine import evaluate, mask_train_one_epoch
 from losses import DistillationLoss
 from masked_functions import (
-    update_temperature,
-    get_binary_mask,
     analyze_nonzero_parameters,
+    get_binary_mask,
+    update_temperature,
 )
 from samplers import RASampler
-from torch.utils.tensorboard import SummaryWriter
 
 
 def get_args_parser():
@@ -263,32 +265,94 @@ def get_args_parser():
     )
 
     # Learning rate schedule parameters
-    parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
-                        help='LR scheduler (default: "cosine"')
-    parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
-                        help='learning rate (default: 5e-4)')
-    parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
-                        help='learning rate noise on/off epoch percentages')
-    parser.add_argument('--lr-noise-pct', type=float, default=0.67, metavar='PERCENT',
-                        help='learning rate noise limit percent (default: 0.67)')
-    parser.add_argument('--lr-noise-std', type=float, default=1.0, metavar='STDDEV',
-                        help='learning rate noise std-dev (default: 1.0)')
-    parser.add_argument('--warmup-lr', type=float, default=1e-5, metavar='LR',
-                        help='warmup learning rate (default: 1e-5)')
-    parser.add_argument('--min-lr', type=float, default=1e-5, metavar='LR',
-                        help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
+    parser.add_argument(
+        "--sched",
+        default="cosine",
+        type=str,
+        metavar="SCHEDULER",
+        help='LR scheduler (default: "cosine"',
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=5e-4,
+        metavar="LR",
+        help="learning rate (default: 5e-4)",
+    )
+    parser.add_argument(
+        "--lr-noise",
+        type=float,
+        nargs="+",
+        default=None,
+        metavar="pct, pct",
+        help="learning rate noise on/off epoch percentages",
+    )
+    parser.add_argument(
+        "--lr-noise-pct",
+        type=float,
+        default=0.67,
+        metavar="PERCENT",
+        help="learning rate noise limit percent (default: 0.67)",
+    )
+    parser.add_argument(
+        "--lr-noise-std",
+        type=float,
+        default=1.0,
+        metavar="STDDEV",
+        help="learning rate noise std-dev (default: 1.0)",
+    )
+    parser.add_argument(
+        "--warmup-lr",
+        type=float,
+        default=1e-5,
+        metavar="LR",
+        help="warmup learning rate (default: 1e-5)",
+    )
+    parser.add_argument(
+        "--min-lr",
+        type=float,
+        default=1e-5,
+        metavar="LR",
+        help="lower lr bound for cyclic schedulers that hit 0 (1e-5)",
+    )
 
-    parser.add_argument('--decay-epochs', type=float, default=30, metavar='N',
-                        help='epoch interval to decay LR')
-    parser.add_argument('--warmup-epochs', type=int, default=0, metavar='N',
-                        help='epochs to warmup LR, if scheduler supports')
-    parser.add_argument('--cooldown-epochs', type=int, default=10, metavar='N',
-                        help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
-    parser.add_argument('--patience-epochs', type=int, default=10, metavar='N',
-                        help='patience epochs for Plateau LR scheduler (default: 10')
-    parser.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RATE',
-                        help='LR decay rate (default: 0.1)')
-    
+    parser.add_argument(
+        "--decay-epochs",
+        type=float,
+        default=30,
+        metavar="N",
+        help="epoch interval to decay LR",
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=0,
+        metavar="N",
+        help="epochs to warmup LR, if scheduler supports",
+    )
+    parser.add_argument(
+        "--cooldown-epochs",
+        type=int,
+        default=10,
+        metavar="N",
+        help="epochs to cooldown LR at min_lr, after cyclic schedule ends",
+    )
+    parser.add_argument(
+        "--patience-epochs",
+        type=int,
+        default=10,
+        metavar="N",
+        help="patience epochs for Plateau LR scheduler (default: 10",
+    )
+    parser.add_argument(
+        "--decay-rate",
+        "--dr",
+        type=float,
+        default=0.1,
+        metavar="RATE",
+        help="LR decay rate (default: 0.1)",
+    )
+
     # 温度衰减参数
     parser.add_argument(
         "--min-temperature",
@@ -307,86 +371,63 @@ def get_args_parser():
     parser.add_argument(
         "--sparse-reg",
         type=float,
-        default=1e-5,  # 默认值，可根据实验调整
-        help="Sparse weight regularization strength (default: 1e-5)",
+        default=1e-6,  # 默认值，可根据实验调整
+        help="Sparse weight regularization strength (default: 1e-6)",
     )
+    parser.add_argument("--num_workers", default=0, type=int)
     parser.set_defaults(train_mode=True)
     return parser
 
 
 def main(args):
 
-    utils.init_distributed_mode(args)
+    # 初始化 Lightning Fabric
+    fabric = Fabric(
+        accelerator="auto",
+        devices="auto",
+        strategy="ddp",
+        loggers=TensorBoardLogger(root_dir="outputs"),
+    )
+    fabric.launch()
 
-    print(args)
+    fabric.print(args)
 
-    device = torch.device(args.device)
+    device = fabric.device
 
     if args.distillation_type != "none" and args.finetune and not args.eval:
         raise NotImplementedError("Finetuning with distillation not yet supported")
 
-    seed = args.seed + utils.get_rank() if args.distributed else args.seed
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-    cudnn.benchmark = True
+    if args.seed is not None:
+        L.seed_everything(args.seed)
 
     # dataset
     dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
     dataset_val, _ = build_dataset(is_train=False, args=args)
 
-    if True:  # args.distributed
-        print(
-            f"Creating distributed samplers for training and validation datasets with {args.data_set} dataset."
-        )
-        num_tasks = dist.get_world_size()
-        global_rank = dist.get_rank()
-        if args.repeated_aug:
-            sampler_train = RASampler(
-                dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-            )
-        else:
-            sampler_train = DistributedSampler(
-                dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-            )
-        if args.dist_eval:
-            if len(dataset_val) % num_tasks != 0:
-                print(
-                    "Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. "
-                    "This will slightly alter validation results as extra duplicate entries are added to achieve "
-                    "equal num of samples per-process."
-                )
-            sampler_val = DistributedSampler(
-                dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False
-            )
-        else:
-            sampler_val = SequentialSampler(dataset_val)
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-
     data_loader_train = DataLoader(
         dataset_train,
-        sampler=sampler_train,
-        batch_size=args.batch_size,
+        batch_size=args.batch_size,  # per-device batch size, global batch size = per-device batch size * number of gpu
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=True,
+        shuffle=True,
     )
-
     data_loader_val = DataLoader(
         dataset_val,
-        sampler=sampler_val,
         batch_size=int(1.5 * args.batch_size),
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=False,
+        shuffle=False,
+    )
+    data_loader_train, data_loader_val = fabric.setup_dataloaders(
+        data_loader_train, data_loader_val
     )
 
     # 创建 ancestor model
     ancestor_model = None
     if args.distillation_type != "none":
-        print(f"Creating ancestor model: {args.ancestor_model}")
+        fabric.print(f"Creating ancestor model: {args.ancestor_model}")
         # ancestor_pretrained is True when args.ancestor_path is empty
         ancestor_pretrained = not bool(args.ancestor_path)
         ancestor_model = create_model(
@@ -401,19 +442,19 @@ def main(args):
                     args.ancestor_path, map_location="cpu", check_hash=True
                 )
             else:
-                checkpoint = torch.load(args.ancestor_path, map_location="cpu")
+                checkpoint = fabric.load(args.ancestor_path)
 
             # 获取当前模型的状态字典
             state_dict = ancestor_model.state_dict()
 
             ancestor_model.load_state_dict(checkpoint["model"])
-        ancestor_model.to(device)
+        ancestor_model = fabric.setup_module(ancestor_model)
         ancestor_model.eval()
 
     n_parameters = sum(
         p.numel() for p in ancestor_model.parameters() if p.requires_grad
     )
-    print("number of params in ancestor_model:", n_parameters)
+    fabric.print("number of params in ancestor_model:", n_parameters)
 
     # For stage 1: Construct auxiliary model
     if args.stage == "stage1":
@@ -427,10 +468,11 @@ def main(args):
                 drop_path_rate=0.0,
             )
             model.load_state_dict(ancestor_model.state_dict(), strict=True)
-            model.to(device)
+            model = fabric.setup_module(model)
 
     # For Stage 2: Construct descendant models
     if args.stage == "stage2":
+        # model为子代模型
         model = create_model(
             args.model,
             pretrained=args.pretrained,
@@ -446,7 +488,7 @@ def main(args):
                     args.finetune, map_location="cpu", check_hash=True
                 )
             else:
-                checkpoint = torch.load(args.finetune, map_location="cpu")
+                checkpoint = fabric.load(args.finetune)
 
             checkpoint_model = checkpoint
             state_dict = model.state_dict()
@@ -460,7 +502,7 @@ def main(args):
                     k in checkpoint_model
                     and checkpoint_model[k].shape != state_dict[k].shape
                 ):
-                    print(f"Removing key {k} from pretrained checkpoint")
+                    fabric.print(f"Removing key {k} from pretrained checkpoint")
                     del checkpoint_model[k]
 
             pos_embed_checkpoint = checkpoint_model["pos_embed"]
@@ -486,8 +528,6 @@ def main(args):
 
             model.load_state_dict(checkpoint_model, strict=False)
 
-        model.to(device)
-
     model_ema = None
     if args.model_ema:
         # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
@@ -498,83 +538,90 @@ def main(args):
             resume="",
         )
 
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        model_without_ddp = model.module
+    # Fabric will handle the DDP wrapping
+    # if args.distributed:
+    #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+    #     model_without_ddp = model.module
 
     if not args.unscale_lr:
-        linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() * args.accumulation_step / 512.0
+        linear_scaled_lr = (
+            args.lr
+            * args.batch_size
+            * fabric.world_size
+            * args.accumulation_step
+            / 512.0
+        )
         args.lr = linear_scaled_lr
 
     if args.stage == "stage2":
-        optimizer = create_optimizer(args, model_without_ddp)
-
+        optimizer = create_optimizer(args, model)
+        model, optimizer = fabric.setup(model, optimizer)
         lr_scheduler, _ = create_scheduler(args, optimizer)
 
     # wrap the criterion in our custom DistillationLoss, which
     # just dispatches to the original criterion if args.distillation_type is 'none'
     criterion = DistillationLoss(
-        torch.nn.CrossEntropyLoss(), #base_criterion
+        torch.nn.CrossEntropyLoss(),  # base_criterion
         ancestor_model,
         args.distillation_type,
         args.distillation_alpha,
         args.distillation_tau,
     )
 
-    output_dir = Path(args.output_dir)
     if args.eval:
-        test_stats = evaluate(data_loader_val, model, device)
-        print(
+        test_stats = evaluate(fabric, data_loader_val, model, device)
+        fabric.print(
             f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%"
         )
         return
 
-    print(f"Start training for {args.epochs} epochs")
+    fabric.print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     max_accuracy = 0.0
 
     epochs = args.epochs
-    lr = args.lr
-    threshold = args.threshold
     initial_temp = args.temperature
     min_temp = args.min_temperature
 
-    # 创建SummaryWriter
-    writer = SummaryWriter(log_dir=os.path.join(args.output_dir, 'tensorboard_logs'))
+    # 评估祖先模型性能
+    evaluate(fabric, data_loader_val, ancestor_model)
 
+    # 获取原始模型
+    model_without_prefix = model.module if hasattr(model, "module") else model
 
     # 进入mask训练阶段
     if args.stage == "stage1":
 
         # 为每个可训练参数新建mask_logits
-        model_without_ddp.mask_logits = {}
-        for name, param in model_without_ddp.named_parameters():
+        model_without_prefix.mask_logits = {}
+        for name, param in model_without_prefix.named_parameters():
             if param.requires_grad:  # and param.dim() > 1
-                model_without_ddp.mask_logits[name] = torch.nn.Parameter(
+                model_without_prefix.mask_logits[name] = torch.nn.Parameter(
                     torch.zeros_like(param, device=device), requires_grad=True
                 )
 
         # 创建单个优化器优化所有mask_logits
         mask_optimizer = torch.optim.Adam(
-            model_without_ddp.mask_logits.values(), lr=args.lr
+            model_without_prefix.mask_logits.values(), lr=args.lr
         )
+        mask_optimizer = fabric.setup_optimizers(mask_optimizer)
 
         # 为mask_optimizer创建学习率调度器
         lr_scheduler, _ = create_scheduler(args, mask_optimizer)
 
-        #评估祖先模型的性能
-        test_stats = evaluate(data_loader_val, ancestor_model, device)
-        
         for epoch in range(epochs):
             # 更新温度
             current_temp = update_temperature(
                 initial_temp, min_temp, epoch, epochs, args.temperature_decay
             )
 
-            print(f"Epoch {epoch+1}/{epochs} with temperature: {current_temp:.4f}")
+            fabric.print(
+                f"Epoch {epoch+1}/{epochs} with temperature: {current_temp:.4f}"
+            )
 
             train_result = mask_train_one_epoch(
-                model_without_ddp,
+                fabric,
+                model_without_prefix,
                 ancestor_model,
                 criterion,
                 data_loader_train,
@@ -589,40 +636,40 @@ def main(args):
                 mask_only=True,
                 temperature=current_temp,
                 sparse_reg=args.sparse_reg,  # 稀疏正则化参数
-                writer = writer,  # 添加TensorBoard记录器
             )
 
-            lr_scheduler.step(epoch)  
-            
+            lr_scheduler.step(epoch)
+
             # 在评估前加载最新的参数
-            if train_result['final_sparse_state'] is not None:
-                model_without_ddp.load_state_dict(train_result['final_sparse_state'], strict=True)
+            if train_result["final_sparse_state"] is not None:
+                model.load_state_dict(train_result["final_sparse_state"], strict=True)
 
             # 评估训练后的效果
-            test_stats = evaluate(data_loader_val, model, device)    
-            print(f"Epoch {epoch+1}/{epochs} - Accuracy: {test_stats['acc1']:.1f}%")
+            test_stats = evaluate(fabric, data_loader_val, model)
 
-        total_time = time.time() - start_time
-        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print("Total training time {}".format(total_time_str))
+            total_time = time.time() - start_time
+            total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+            fabric.print("Total training time {}".format(total_time_str))
 
-        # Save checkpoint
-        if args.output_dir and test_stats["acc1"] > max_accuracy:
-            max_accuracy = test_stats["acc1"]
-            checkpoint = {
-                "model": model.state_dict(),
-                "args": args,
-                "mask_logits": model_without_ddp.mask_logits.state_dict(),
-                "optimizer": mask_optimizer.state_dict(),
-                "epoch": epoch,
-            }
+            if fabric.is_global_zero:
+                fabric.print(f"Epoch {epoch+1} - Accuracy: {test_stats['acc1']:.1f}%")
 
-            torch.save(checkpoint, os.path.join(args.output_dir, "checkpoint_best.pth"))
+                # Save checkpoint
+                if fabric.is_global_zero and test_stats["acc1"] > max_accuracy:
+                    max_accuracy = test_stats["acc1"]
+                    checkpoint = {
+                        "model": model.state_dict(),
+                        "args": args,
+                        "mask_logits": model.mask_logits,
+                        "optimizer": mask_optimizer.state_dict(),
+                        "epoch": epoch,
+                    }
+                    fabric.save(
+                        os.path.join(args.output_dir, "checkpoint_best.pth"), checkpoint
+                    )
 
         # After training, generate binary mask for stage1
-        hard_mask = get_binary_mask(
-            model_without_ddp.mask_logits, args.threshold, temperature=0.1
-        )
+        hard_mask = get_binary_mask(model.mask_logits, args.threshold, temperature=0.1)
 
         # Apply mask to get final parameters
         Learngene = model.state_dict()
@@ -630,8 +677,8 @@ def main(args):
             Learngene[name] = Learngene[name] * mask
 
         # Save final masked model
-        if args.output_dir:
-            torch.save(
+        if args.output_dir and fabric.is_global_zero:
+            fabric.save(
                 {
                     "model": Learngene,
                     "mask": hard_mask,
@@ -639,20 +686,18 @@ def main(args):
                 os.path.join(args.output_dir, "masked_model.pth"),
             )
 
-        writer.close()  # 关闭TensorBoard记录器
+        fabric.print(
+            f"Auxiliary model parameter count after training: {sum(p.numel() for p in model.parameters())}"
+        )
 
-    print(
-        f"Auxiliary model parameter count after training: {sum(p.numel() for p in model.parameters())}"
-    )
-
-    total_nonzero, total_params, layer_stats = analyze_nonzero_parameters(
-        model, args.print_details
-    )
-    print(f"\nTotal parameters in auxiliary model: {total_params}")
-    print(
-        f"Non-zero parameters in auxiliary model: {total_nonzero} ({100.0 * total_nonzero / total_params:.2f}%)"
-    )
-    print("Learngene successfully extracted and loaded into auxiliary model")
+        total_nonzero, total_params, layer_stats = analyze_nonzero_parameters(
+            model, args.print_details
+        )
+        fabric.print(f"\nTotal parameters in auxiliary model: {total_params}")
+        fabric.print(
+            f"Non-zero parameters in auxiliary model: {total_nonzero} ({100.0 * total_nonzero / total_params:.2f}%)"
+        )
+        fabric.print("Learngene successfully extracted and loaded into auxiliary model")
 
 
 if __name__ == "__main__":
