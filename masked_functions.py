@@ -1,4 +1,4 @@
-】import torch
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
@@ -78,35 +78,3 @@ def get_binary_mask(mask_logits, threshold, temperature=0.1):
     return hard_masks
 
 
-def analyze_nonzero_parameters(model, print_details=False):
-    total_nonzero = 0
-    total_params = 0
-    layer_stats = {}
-    for name, param in model.named_parameters():
-        numel = param.numel()
-        nonzero = (param != 0).sum().item()
-        layer_stats[name] = (nonzero, numel)
-        total_nonzero += nonzero
-        total_params += numel
-
-    if print_details:
-        print("\nNon-zero parameter distribution (sorted by block):")
-        block_layers = []
-        for name in layer_stats:
-            if name.startswith("blocks."):
-                parts = name.split(".")
-                if len(parts) > 2 and parts[1].isdigit():
-                    block_idx = int(parts[1])
-                    subname = ".".join(parts[2:])
-                    block_layers.append((block_idx, subname, name))
-        block_layers.sort()
-        for block_idx, subname, name in block_layers:
-            nonzero, numel = layer_stats[name]
-            sparse = 100.0 * (1 - nonzero / numel)
-            print(f"{name}: {nonzero}/{numel} ({sparse:.2f}% sparse)")
-        for name in sorted(layer_stats.keys()):
-            if not name.startswith("blocks."):
-                nonzero, numel = layer_stats[name]
-                sparse = 100.0 * (1 - nonzero / numel)
-                print(f"{name}: {nonzero}/{numel} ({sparse:.2f}% sparse)")
-    return total_nonzero, total_params, layer_stats

@@ -23,7 +23,6 @@ from datasets import build_dataset
 from engine import evaluate, mask_train_one_epoch
 from losses import DistillationLoss
 from masked_functions import (
-    analyze_nonzero_parameters,
     get_binary_mask,
     update_temperature,
 )
@@ -686,17 +685,6 @@ def main(args):
                 os.path.join(args.output_dir, "masked_model.pth"),
             )
 
-        fabric.print(
-            f"Auxiliary model parameter count after training: {sum(p.numel() for p in model.parameters())}"
-        )
-
-        total_nonzero, total_params, layer_stats = analyze_nonzero_parameters(
-            model, args.print_details
-        )
-        fabric.print(f"\nTotal parameters in auxiliary model: {total_params}")
-        fabric.print(
-            f"Non-zero parameters in auxiliary model: {total_nonzero} ({100.0 * total_nonzero / total_params:.2f}%)"
-        )
         fabric.print("Learngene successfully extracted and loaded into auxiliary model")
 
 
