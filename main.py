@@ -625,7 +625,6 @@ def main(args):
                 criterion,
                 data_loader_train,
                 mask_optimizer,
-                device,
                 epoch,
                 max_norm=0,
                 model_ema=None,

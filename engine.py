@@ -21,7 +21,6 @@ def mask_train_one_epoch(
     criterion,
     data_loader: Iterable,
     optimizer: torch.optim.Optimizer,
-    device: torch.device,
     epoch: int,
     max_norm: float = 0,
     model_ema: Optional[ModelEma] = None,
